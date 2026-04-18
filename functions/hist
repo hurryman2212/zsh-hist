@@ -39,6 +39,96 @@ typeset -gHA _HIST__ARGS=(
   unset 'compstate[vared]'
 }
 
+.hist.sync() {
+  emulate -L zsh -o extendedglob -o warncreateglobal
+
+  [[ -n $HISTFILE ]] && (( SAVEHIST != 0 )) ||
+      return 0
+
+  local raw_tmp=$HISTFILE.zsh-hist.raw.$$.${RANDOM}
+  local out_tmp=$HISTFILE.zsh-hist.out.$$.${RANDOM}
+  local extended=0
+  [[ -o extendedhistory ]] &&
+      extended=1
+  local skip_csv=
+  if [[ $1 == -- ]]; then
+    shift
+    skip_csv="${(j:,:)@}"
+  fi
+
+  # Let zsh serialize the current history list so existing timestamps survive,
+  # then unmetafy/filter the resulting file before putting it back in place.
+  builtin fc -W "$raw_tmp" || {
+    command rm -f -- "$raw_tmp" "$out_tmp"
+    return 1
+  }
+
+  command perl - "$extended" "$skip_csv" "$raw_tmp" "$out_tmp" <<'PERL' || {
+use strict;
+use warnings;
+use bytes;
+
+my ($extended, $skip_csv, $src, $dst) = @ARGV;
+my %skip = map { $_ => 1 } grep { length } split /,/, ($skip_csv // q());
+
+open my $in, '<', $src or die "open $src: $!";
+open my $out, '>', $dst or die "open $dst: $!";
+binmode $in;
+binmode $out;
+
+my $buf = q();
+my $ordinal = 0;
+
+sub unmetafy {
+  $_[0] =~ s/\x83(.)/chr(ord($1) ^ 32)/ges;
+}
+
+sub flush_record {
+  return unless length $buf;
+  ++$ordinal;
+  print {$out} $buf unless $skip{$ordinal};
+  $buf = q();
+}
+
+if ($extended) {
+  while (defined(my $line = <$in>)) {
+    unmetafy($line);
+    if ($line =~ /^: \d+:\d*;/) {
+      flush_record();
+      $buf = $line;
+    } else {
+      $buf .= $line;
+    }
+  }
+  flush_record();
+} else {
+  while (defined(my $line = <$in>)) {
+    unmetafy($line);
+    $buf .= $line;
+
+    my $slashes = 0;
+    if ($line =~ /(\\+)\n\z/) {
+      $slashes = length $1;
+    }
+
+    ($slashes % 2 == 0) &&
+        flush_record();
+  }
+  flush_record();
+}
+PERL
+    command rm -f -- "$raw_tmp" "$out_tmp"
+    return 1
+  }
+
+  command mv -f -- "$out_tmp" "$HISTFILE" || {
+    command rm -f -- "$raw_tmp" "$out_tmp"
+    return 1
+  }
+
+  command rm -f -- "$raw_tmp"
+}
+
 .hist.yes() {
   [[ -v opts[-f] ]] &&
       return 0
@@ -85,8 +175,9 @@ hist() {
       if .hist.yes "Revert last 'hist' action & all entries since then?"; then
         builtin fc -P
         local ret=$?
-        if (( ? == 0 )); then
-          builtin fc -W
+        if (( ret == 0 )); then
+          .hist.sync ||
+              return 1
           [[ -v opts[-q] ]] ||
               print 'Revert successful. Previous history restored.'
         else
@@ -100,8 +191,6 @@ hist() {
   esac
 
   local -A entries=()
-  local -a ignore=()
-  local +h HISTORY_IGNORE=
   local sel=
   shift
   if [[ $act == c* ]]; then
@@ -111,31 +200,24 @@ hist() {
     fi
     for sel in ${(k)history}; do
       if [[ $history[$sel] == (#a$1)$history[$(( sel + 1 ))] ]]; then
-        ignore+=( "${(b)history[$sel]}" )
         entries[$sel]=$history[$sel]
       fi
     done
-    HISTORY_IGNORE="(${(j:|:)ignore})"
   elif (( $# )); then
     for sel do
       case $sel in
         ( <1-> )
-          ignore+=( "${(b)history[$sel]}" )
           entries[$sel]=$history[$sel]
         ;;
         ( -<1-> )
           sel=${${(@k)history}[-sel]}
-          ignore+=( "${(b)history[$sel]}" )
           entries[$sel]=$history[$sel]
           ;;
         ( * )
-          ignore+=( $~~sel )
           entries+=( "${(@kv)history[(R)$~sel]}" )
         ;;
       esac
     done
-    HISTORY_IGNORE=$ignore; (( $#ignore[@] > 1 )) &&
-        HISTORY_IGNORE="(${(j:|:)ignore})"
   else
     print -l -u2 - 'hist: missing selection argument'
     return 1
@@ -167,8 +249,18 @@ hist() {
         msg="Merge $single_plural for editing?"
 
     if [[ $#entries -eq 1 && ! -v opts[-i] ]] || .hist.yes $msg; then
-      builtin fc -W
-      builtin fc -p $HISTFILE $HISTSIZE $SAVEHIST
+      local -a skip_ordinals=()
+      local -i ordinal=0
+      for key in ${(@kn)history}; do
+        (( ++ordinal ))
+        [[ -v entries[$key] ]] &&
+            skip_ordinals+=( "$ordinal" )
+      done
+
+      .hist.sync -- "${(@)skip_ordinals}" ||
+          return 1
+      builtin fc -p $HISTFILE $HISTSIZE $SAVEHIST ||
+          return 1
       [[ $act != [en]* && ! -v opts[-q] ]] &&
           print "$single_plural deleted."
     else
@@ -191,12 +283,14 @@ hist() {
           {
             builtin fc -P
           } always {
-            builtin fc -W
+            .hist.sync ||
+                return 1
             print -l - '' 'Deleted entries restored.'
           }
         else
           print -rS - "$new"
-          builtin fc -W
+          .hist.sync ||
+              return 1
           [[ -v opts[-q] ]] ||
               print -l '' 'New entry saved.'
         fi
@@ -214,7 +308,8 @@ hist() {
           entry="$REPLY"
         print -rS - "$entry"
       done
-      builtin fc -W
+      .hist.sync ||
+          return 1
       [[ -v opts[-q] ]] ||
           print "$single_plural reformatted."
       ;;
