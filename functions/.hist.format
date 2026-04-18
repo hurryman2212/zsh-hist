@@ -35,6 +35,7 @@ zmodload -F zsh/parameter p:functions
     [[ -v functions[.hist.tmp.] ]] &&
         unfunction .hist.tmp.
   }
+  return 1
 }
 
 .hist.format "$@"
